@@ -803,6 +803,8 @@ test("streamOpenCode continues after OpenCode v2.1.1 refusals", async () => {
     "Permission denied: external_directory",
     { type: "permission.rejected", message: "Permission denied: external_directory" },
     'No tool named "bash" is currently available. Use one of the available tools instead.',
+    "Unknown tool: bash",
+    'Invalid arguments for tool "read":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.',
   ];
   for (const error of refusals) {
     const message = await withFakeOpenCode(

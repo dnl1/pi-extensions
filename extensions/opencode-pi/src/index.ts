@@ -1864,10 +1864,12 @@ export function agentDefinition(dialect: CliDialect): string {
 
 // OpenCode v2.1.1 also refuses with "Permission denied: <rule>" (e.g. a read
 // outside the project directory) and "No tool named ..." (a tool the agent
-// does not declare). The first is anchored so an OS error such as
+// does not declare). OpenCode v2 also stops a call before it runs with
+// "Unknown tool: <name>" and with "Invalid arguments for tool ..." when the
+// input fails validation. The patterns are anchored so an OS error such as
 // "EACCES: permission denied, open ..." still counts as executed.
 const OPENCODE_PERMISSION_REJECTION =
-  /cannot ask the user for permission|request was rejected|rejected permission|user rejected|^permission denied: [\w.-]+$|^no tool named "[^"]*" is currently available/i;
+  /cannot ask the user for permission|request was rejected|rejected permission|user rejected|^permission denied: [\w.-]+$|^no tool named "[^"]*" is currently available|^unknown tool: |^invalid arguments for tool "[^"]*"/i;
 
 /** Whether a native tool's error state is OpenCode refusing it before it ran. */
 function isRefusedTool(toolState: { status?: string; error?: unknown } | undefined): boolean {
