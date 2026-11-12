@@ -1868,10 +1868,13 @@ export function agentDefinition(dialect: CliDialect): string {
 // outside the project directory) and "No tool named ..." (a tool the agent
 // does not declare). OpenCode v2 also stops a call before it runs with
 // "Unknown tool: <name>" and with "Invalid arguments for tool ..." when the
-// input fails validation. The patterns are anchored so an OS error such as
-// "EACCES: permission denied, open ..." still counts as executed.
+// input fails validation. OpenCode v2.0.30 also stops a call whose input is
+// not valid JSON, was cut off, or names a tool missing from the request, with
+// a message that says it was not executed. The patterns are anchored so an
+// OS error such as "EACCES: permission denied, open ..." still counts as
+// executed.
 const OPENCODE_PERMISSION_REJECTION =
-  /cannot ask the user for permission|request was rejected|rejected permission|user rejected|^permission denied: [\w.-]+$|^no tool named "[^"]*" is currently available|^unknown tool: |^invalid arguments for tool "[^"]*"/i;
+  /cannot ask the user for permission|request was rejected|rejected permission|user rejected|^permission denied: [\w.-]+$|^no tool named "[^"]*" is currently available|^unknown tool: |^invalid arguments for tool "[^"]*"|^the tool input could not be parsed as json, so the call was not executed|^the tool call was not executed because|^tool call arguments were not completed and were not executed|^tool is not available for this request: /i;
 
 /** Whether a native tool's error state is OpenCode refusing it before it ran. */
 function isRefusedTool(toolState: { status?: string; error?: unknown } | undefined): boolean {

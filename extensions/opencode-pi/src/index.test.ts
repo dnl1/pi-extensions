@@ -805,6 +805,11 @@ test("streamOpenCode continues after OpenCode v2.1.1 refusals", async () => {
     'No tool named "bash" is currently available. Use one of the available tools instead.',
     "Unknown tool: bash",
     'Invalid arguments for tool "read":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.',
+    // OpenCode v2.0.30 stops a call with unusable arguments before it runs.
+    'The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments.\n\nInput excerpt (first 21 of 21 characters):\n{"path":"inside.txt",',
+    "The tool call was not executed because the output token limit (stop reason: length) was reached before you could complete the arguments. Break large payloads into smaller tool calls and reissue the call with complete arguments.",
+    "Tool call arguments were not completed and were not executed. Reissue the call with complete arguments.",
+    "Tool is not available for this request: read",
   ];
   for (const error of refusals) {
     const message = await withFakeOpenCode(
