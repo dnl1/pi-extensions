@@ -819,6 +819,224 @@ test("streamOpenCode continues after OpenCode v2.1.1 refusals", async () => {
   }
 });
 
+/**
+ * OpenCode v2 events for a model that calls Pi's `bash` natively: OpenCode
+ * refuses the call (the agent does not offer `bash`), finishes the step, and
+ * the model's next message gives up.
+ */
+function nativeBashEvents(sessionID = "ses-native") {
+  const event = (type: string, messageID: string, part: Record<string, unknown>) => ({
+    type,
+    sessionID,
+    part: { sessionID, messageID, ...part },
+  });
+  return {
+    refused: [
+      event("step_start", "msg_1", { type: "step-start" }),
+      event("text", "msg_1", { type: "text", text: "Running it." }),
+      event("tool_use", "msg_1", {
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "error",
+          input: { command: "wc -l a.txt" },
+          error: 'No tool named "bash" is currently available. Please use a tool from the available tool list.',
+        },
+      }),
+      event("step_finish", "msg_1", { type: "step-finish", reason: "tool-calls" }),
+    ],
+    gaveUp: [
+      event("text", "msg_2", { type: "text", text: "Pi tools are unavailable in this session." }),
+    ],
+  };
+}
+
+function toolCallsOf(message: { content: unknown[] }) {
+  return message.content.flatMap((block: any) =>
+    block.type === "toolCall" ? [{ name: block.name, arguments: block.arguments }] : [],
+  );
+}
+
+test("streamOpenCode hands a refused native call to the Pi tool of the same name", async () => {
+  const { refused, gaveUp } = nativeBashEvents();
+  const message = await withFakeOpenCode(
+    fakeEventScript([...refused, ...gaveUp]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.equal(message.errorMessage, undefined);
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(toolCallsOf(message), [{ name: "bash", arguments: { command: "wc -l a.txt" } }]);
+  assert.equal(JSON.stringify(message.content).includes("unavailable"), false);
+});
+
+test("streamOpenCode stops OpenCode once the refused step has a call for Pi", async () => {
+  const { refused } = nativeBashEvents();
+  const started = Date.now();
+  const message = await withFakeOpenCode(
+    `${fakeEventScript(refused)}\nsetTimeout(() => {}, 30000);`,
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.equal(message.errorMessage, undefined);
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(toolCallsOf(message), [{ name: "bash", arguments: { command: "wc -l a.txt" } }]);
+  assert.ok(Date.now() - started < 10_000, "the turn waited for OpenCode to exit on its own");
+});
+
+test("streamOpenCode keeps a refused call to a tool Pi does not have as a refusal", async () => {
+  const { refused, gaveUp } = nativeBashEvents();
+  const message = await withFakeOpenCode(
+    fakeEventScript([...refused, ...gaveUp]),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.equal(message.errorMessage, undefined);
+  assert.equal(message.stopReason, "stop");
+  assert.deepEqual(toolCallsOf(message), []);
+});
+
+test("streamOpenCode keeps a refused call whose arguments do not fit the Pi tool as a refusal", async () => {
+  // OpenCode v1's own read takes filePath; Pi's read requires path.
+  const context: Context = {
+    messages: [],
+    tools: [
+      {
+        name: "read",
+        description: "read tool",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    ] as unknown as Context["tools"],
+  };
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "tool_use",
+        part: {
+          messageID: "msg_1",
+          tool: "read",
+          state: {
+            status: "error",
+            input: { filePath: "a.txt" },
+            error: "The user rejected permission to use this specific tool call.",
+          },
+        },
+      },
+      { type: "step_finish", part: { messageID: "msg_1", reason: "tool-calls" } },
+      {
+        type: "text",
+        part: { messageID: "msg_2", text: '<pi_tool_call>{"name":"read","arguments":{"path":"a.txt"}}</pi_tool_call>' },
+      },
+    ]),
+    () => streamOpenCode(fakeModel(), context).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.equal(message.errorMessage, undefined);
+  assert.deepEqual(toolCallsOf(message), [{ name: "read", arguments: { path: "a.txt" } }]);
+});
+
+test("streamOpenCode runs a request once when the model sends it as a marker and natively", async () => {
+  const { refused } = nativeBashEvents();
+  const marker = {
+    type: "text",
+    part: { messageID: "msg_1", text: '<pi_tool_call>{"name":"bash","arguments":{"command":"wc -l a.txt"}}</pi_tool_call>' },
+  };
+  const message = await withFakeOpenCode(
+    fakeEventScript([marker, ...refused]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.deepEqual(toolCallsOf(message), [{ name: "bash", arguments: { command: "wc -l a.txt" } }]);
+});
+
+test("streamOpenCode stops at the next step when OpenCode sends no message IDs or step_finish", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "tool_use",
+        part: {
+          tool: "bash",
+          state: {
+            status: "error",
+            input: { command: "wc -l a.txt" },
+            error: 'No tool named "bash" is currently available. Please use a tool from the available tool list.',
+          },
+        },
+      },
+      { type: "step_start", part: { type: "step-start" } },
+      {
+        type: "text",
+        part: { text: 'Retrying. <pi_tool_call>{"name":"bash","arguments":{"command":"echo again"}}</pi_tool_call>' },
+      },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.deepEqual(toolCallsOf(message), [{ name: "bash", arguments: { command: "wc -l a.txt" } }]);
+});
+
+test("streamOpenCode hands the call over even when OpenCode ignores SIGTERM", async () => {
+  const { refused } = nativeBashEvents();
+  const message = await withFakeOpenCode(
+    `process.on("SIGTERM", () => {});\n${fakeEventScript(refused)}\nsetTimeout(() => {}, 60000);`,
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"]), { timeoutMs: 8000 }).result(),
+    "opencode v2.1.1",
+  );
+
+  assert.equal(message.errorMessage, undefined);
+  assert.deepEqual(toolCallsOf(message), [{ name: "bash", arguments: { command: "wc -l a.txt" } }]);
+});
+
+test("streamOpenCode starts the turn after a handed-over call in a fresh session", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "invocations.jsonl");
+  const piSessionId = `pi-native-${Date.now()}`;
+  const { refused } = nativeBashEvents("ses-native-1");
+  try {
+    const first = await withFakeOpenCode(
+      `const fs = require("node:fs");
+if (process.argv.includes("session")) process.exit(0);
+let body = "";
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), stdin: body }) + "\\n");
+  for (const event of ${JSON.stringify(refused)}) process.stdout.write(JSON.stringify(event) + "\\n");
+});
+`,
+      () =>
+        streamOpenCode(fakeModel(), userContext(["first question"], ["bash"]), {
+          sessionId: piSessionId,
+        }).result(),
+      "opencode v2.1.1",
+    );
+    assert.equal(first.stopReason, "toolUse");
+
+    const second = await withFakeOpenCode(
+      sessionFakeScript(capturePath, "ses-native-2"),
+      () =>
+        streamOpenCode(fakeModel(), userContext(["first question", "second question"], ["bash"]), {
+          sessionId: piSessionId,
+        }).result(),
+      "opencode v2.1.1",
+    );
+    assert.equal(second.stopReason, "stop");
+
+    const invocations = readInvocations(capturePath);
+    assert.equal(invocations.length, 2);
+    assert.equal(invocations[1]?.args.includes("--session"), false);
+    assert.match(invocations[1]?.stdin ?? "", /first question/);
+  } finally {
+    await cleanupPiSessionState(piSessionId);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
 test("streamOpenCode fails when OpenCode completed a locally executed native tool", async () => {
   const message = await withFakeOpenCode(
     fakeEventScript([

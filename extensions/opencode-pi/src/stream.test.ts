@@ -337,6 +337,94 @@ test("streamOpenCode streams v1 text and reasoning deltas before the turn finish
   }
 });
 
+test("streamOpenCode hands a refused native call to Pi and drops the model's next message", async () => {
+  const refused = {
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: "prt_tool",
+        messageID: "msg_reply",
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "error",
+          input: { command: "wc -l a.txt" },
+          error: 'No tool named "bash" is currently available. Please use a tool from the available tool list.',
+        },
+      },
+    },
+  };
+  const gaveUp = {
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: "prt_late",
+        messageID: "msg_next",
+        type: "text",
+        text: "Pi tools are unavailable in this session.",
+        time: { start: 1, end: 2 },
+      },
+    },
+  };
+  const events = await collect(
+    fakeServer({ events: [...streamedText("prt_text", ["Running it."]), refused, stepFinish("tool-calls"), gaveUp] }),
+    fakeContext(["bash"]),
+  );
+
+  assert.equal(textDeltas(events).join("").includes("unavailable"), false, JSON.stringify(textDeltas(events)));
+  const done = events.at(-1);
+  if (done?.type !== "done") return assert.fail(`expected done, got ${JSON.stringify(done)}`);
+  assert.equal(done.reason, "toolUse");
+  assert.deepEqual(
+    done.message.content.map((block) => (block.type === "toolCall" ? { name: block.name, arguments: block.arguments } : block)),
+    [
+      { type: "text", text: "Running it." },
+      { name: "bash", arguments: { command: "wc -l a.txt" } },
+    ],
+  );
+});
+
+test("streamOpenCode stops the server session when the model starts its next message", async () => {
+  const refused = {
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: "prt_tool",
+        messageID: "msg_reply",
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "error",
+          input: { command: "wc -l a.txt" },
+          error: 'No tool named "bash" is currently available. Please use a tool from the available tool list.',
+        },
+      },
+    },
+  };
+  const gaveUp = {
+    type: "message.part.updated",
+    properties: {
+      part: { id: "prt_late", messageID: "msg_next", type: "text", text: "Pi tools are unavailable.", time: { start: 1, end: 2 } },
+    },
+  };
+  await withCapture(async (capturePath) => {
+    // OpenCode republishes the refused part, and sends no step-finish.
+    const events = await collect(fakeServer({ capturePath, events: [refused, refused, gaveUp] }), fakeContext(["bash"]));
+
+    assert.equal(textDeltas(events).join("").includes("unavailable"), false);
+    const done = events.at(-1);
+    if (done?.type !== "done") return assert.fail(`expected done, got ${JSON.stringify(done)}`);
+    assert.deepEqual(
+      done.message.content.flatMap((block) => (block.type === "toolCall" ? [{ name: block.name, arguments: block.arguments }] : [])),
+      [{ name: "bash", arguments: { command: "wc -l a.txt" } }],
+    );
+    assert.ok(
+      readCaptured(capturePath).some((entry) => entry.method === "POST" && entry.path === "/session/ses-fake/abort"),
+      "the session kept generating the model's next message",
+    );
+  });
+});
+
 test("streamOpenCode never streams raw tool-call markers into Pi", async () => {
   const reply = `Reading it.\n${TOOL_CALL}`;
   // Five-character deltas cut the marker in several places.
@@ -479,7 +567,7 @@ test("streamOpenCode rejects permission asks and tolerates already-settled ones"
         events: [
           { type: "permission.asked", properties: { id: "per_1", permission: "read" } },
           { type: "permission.asked", properties: { id: "per_2", permission: "read" } },
-          { type: "message.part.updated", properties: { part: { id: "prt_tool", messageID: "msg_reply", type: "tool", tool: "read", state: { status: "error", error: "The user rejected permission to use this specific tool call." } } } },
+          { type: "message.part.updated", properties: { part: { id: "prt_tool", messageID: "msg_reply", type: "tool", tool: "read", state: { status: "error", input: { path: "a.txt" }, error: "The user rejected permission to use this specific tool call." } } } },
           ...streamedText("prt_text", [TOOL_CALL]),
         ],
       }),
@@ -488,6 +576,11 @@ test("streamOpenCode rejects permission asks and tolerates already-settled ones"
     const done = events.at(-1);
     if (done?.type !== "done") return assert.fail(`expected done, got ${JSON.stringify(done)}`);
     assert.equal(done.reason, "toolUse");
+    // The refused native read and the marker are the same request: Pi runs it once.
+    assert.deepEqual(
+      done.message.content.flatMap((block) => (block.type === "toolCall" ? [{ name: block.name, arguments: block.arguments }] : [])),
+      [{ name: "read", arguments: { path: "a.txt" } }],
+    );
     const replies = readCaptured(capturePath).filter((entry) => entry.path.startsWith("/permission/"));
     assert.deepEqual(replies.map((entry) => [entry.path, entry.body]), [
       ["/permission/per_1/reply", { reply: "reject" }],

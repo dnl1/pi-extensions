@@ -40,6 +40,8 @@ const DISCOVERY_TIMEOUT_MS = 8_000;
 const STATUS_TIMEOUT_MS = 10_000;
 const SESSION_DELETE_TIMEOUT_MS = 10_000;
 const STDERR_LIMIT = 20_000;
+/** How long OpenCode gets to exit on SIGTERM after a relayed step. */
+const RELAY_KILL_GRACE_MS = 2_000;
 /**
  * Upper bound for every model turn, applied even when Pi supplies no
  * `timeoutMs`. A session ID reused from the wrong project directory hangs
@@ -1914,6 +1916,9 @@ async function removeSessionDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true }).catch(() => undefined);
 }
 
+/** A native call OpenCode refused that names one of the turn's Pi tools. */
+export type RelayedCall = { name: string; arguments: Record<string, unknown> };
+
 /** Everything one `opencode run` invocation produced. */
 export type OpenCodeTurnState = {
   text: string;
@@ -1924,7 +1929,95 @@ export type OpenCodeTurnState = {
   error?: string;
   finishReason: "stop" | "length";
   timedOut: boolean;
+  /** Refused native calls handed to Pi, all from one assistant message. */
+  relayed?: { messageId?: string; partIds: string[]; calls: RelayedCall[] };
+  /** OpenCode was stopped once the step with the relayed calls ended. */
+  stoppedForRelay?: boolean;
 };
+
+/** The turn's Pi tools by name, as far as relaying needs them. */
+export type PiTools = ReadonlyMap<string, { parameters?: unknown }>;
+
+/**
+ * The Pi tool call behind a native call OpenCode refused before it ran.
+ *
+ * Free models often call Pi's tools (listed in the prompt) natively instead of
+ * writing a marker. The bridge agent does not offer them, so OpenCode refuses
+ * the call, and the model usually concludes the tool does not exist. When the
+ * name is one of the turn's Pi tools and the input has every argument that
+ * tool requires, Pi runs the call instead. OpenCode's own `read` shares the
+ * name of Pi's but not its arguments (v1 takes `filePath`), so such a call
+ * stays a refusal and the model can still answer with a marker.
+ */
+function relayableCall(
+  part: { tool?: unknown; state?: { status?: string; error?: unknown; input?: unknown } } | undefined,
+  piTools: PiTools | undefined,
+): RelayedCall | undefined {
+  if (!piTools || !isRefusedTool(part?.state)) return undefined;
+  const name = typeof part?.tool === "string" ? part.tool : "";
+  const tool = piTools.get(name);
+  const input = part?.state?.input;
+  if (!tool || !input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+  const required = (tool.parameters as { required?: unknown } | undefined)?.required;
+  if (Array.isArray(required) && !required.every((key) => typeof key === "string" && key in input)) {
+    return undefined;
+  }
+  return { name, arguments: input as Record<string, unknown> };
+}
+
+/**
+ * Record a relayed call. Every call has to come from the same message, and a
+ * part OpenCode publishes again is counted once.
+ */
+function recordRelay(
+  state: OpenCodeTurnState,
+  part: { id?: unknown; messageID?: unknown } | undefined,
+  call: RelayedCall,
+): void {
+  state.relayed ??= {
+    messageId: typeof part?.messageID === "string" ? part.messageID : undefined,
+    partIds: [],
+    calls: [],
+  };
+  if (typeof part?.id === "string") {
+    if (state.relayed.partIds.includes(part.id)) return;
+    state.relayed.partIds.push(part.id);
+  }
+  state.relayed.calls.push(call);
+}
+
+/** JSON with sorted object keys, so equal arguments compare equal. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : item,
+  );
+}
+
+/**
+ * Marker calls plus the relayed ones, without a relayed call the model also
+ * wrote as a marker: running a `bash` command twice can do harm.
+ */
+export function mergeRelayedCalls(
+  markerCalls: RelayedCall[],
+  relayed: RelayedCall[] | undefined,
+): RelayedCall[] {
+  const key = (call: RelayedCall) => `${call.name}\u0000${stableJson(call.arguments)}`;
+  const seen = new Set(markerCalls.map(key));
+  return [...markerCalls, ...(relayed ?? []).filter((call) => !seen.has(key(call)))];
+}
+
+/** True once an event belongs to a later message than the relayed calls. */
+function isPastRelay(state: OpenCodeTurnState, messageId: unknown): boolean {
+  return (
+    state.relayed?.messageId !== undefined &&
+    typeof messageId === "string" &&
+    messageId !== state.relayed.messageId
+  );
+}
 
 /** True when OpenCode could not resolve the bridge's agent. */
 export function isAgentNotFoundError(stderr: string): boolean {
@@ -1945,8 +2038,10 @@ export async function runOpenCodeTurn(params: {
   timeoutMs: number;
   model: Model<Api>;
   output: AssistantMessage;
+  /** The turn's Pi tools; refused native calls to them are handed to Pi. */
+  piTools?: PiTools;
 }): Promise<{ code: number | null; state: OpenCodeTurnState }> {
-  const { args, prompt, cwd, signal, timeoutMs, model, output } = params;
+  const { args, prompt, cwd, signal, timeoutMs, model, output, piTools } = params;
   const state: OpenCodeTurnState = {
     text: "",
     thinking: "",
@@ -1981,8 +2076,20 @@ export async function runOpenCodeTurn(params: {
   child.stdout!.setEncoding("utf8");
   child.stderr!.setEncoding("utf8");
 
+  // Pi runs the relayed calls, so the model's next step, written after it saw
+  // OpenCode's refusal, is not needed.
+  // A process that ignores SIGTERM is killed two seconds later, and the turn
+  // timeout no longer applies, so a slow exit cannot fail the turn.
+  const stopForRelay = () => {
+    if (state.stoppedForRelay) return;
+    state.stoppedForRelay = true;
+    clearTimeout(timer);
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), RELAY_KILL_GRACE_MS).unref();
+  };
+
   const handleLine = (line: string) => {
-    if (!line.trim()) return;
+    if (state.stoppedForRelay || !line.trim()) return;
     let event: any;
     try {
       event = JSON.parse(line);
@@ -2001,6 +2108,16 @@ export async function runOpenCodeTurn(params: {
       state.sessionId = event.part.sessionID;
     }
 
+    // The model moved on from the message with the relayed calls. A new step
+    // also counts, for events that carry no message ID.
+    if (
+      isPastRelay(state, event.part?.messageID) ||
+      (state.relayed && event.type === "step_start")
+    ) {
+      stopForRelay();
+      return;
+    }
+
     if (event.type === "text" && typeof event.part?.text === "string") {
       state.text += event.part.text;
       return;
@@ -2015,21 +2132,23 @@ export async function runOpenCodeTurn(params: {
       if (/length|max.?tokens/i.test(String(event.part?.reason ?? ""))) {
         state.finishReason = "length";
       }
-      if (!event.part?.tokens) return;
-      const tokens = event.part.tokens;
-      output.usage.input = Number(tokens.input ?? 0);
-      output.usage.output =
-        Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
-      output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
-      output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
-      output.usage.totalTokens = Number(
-        tokens.total ??
-          output.usage.input +
-            output.usage.output +
-            output.usage.cacheRead +
-            output.usage.cacheWrite,
-      );
-      calculateCost(model, output.usage);
+      const tokens = event.part?.tokens;
+      if (tokens) {
+        output.usage.input = Number(tokens.input ?? 0);
+        output.usage.output =
+          Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+        output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
+        output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+        output.usage.totalTokens = Number(
+          tokens.total ??
+            output.usage.input +
+              output.usage.output +
+              output.usage.cacheRead +
+              output.usage.cacheWrite,
+        );
+        calculateCost(model, output.usage);
+      }
+      if (state.relayed) stopForRelay();
       return;
     }
 
@@ -2044,7 +2163,10 @@ export async function runOpenCodeTurn(params: {
       // that ran and failed (e.g. EACCES "permission denied") still executed.
       if (!isRefusedTool(event.part?.state)) {
         state.toolUse = event.part?.tool ? String(event.part.tool) : "unknown";
+        return;
       }
+      const call = relayableCall(event.part, piTools);
+      if (call) recordRelay(state, event.part, call);
       return;
     }
 
@@ -2112,8 +2234,10 @@ export async function runOpenCodeServerTurn(params: {
   output: AssistantMessage;
   sink: OpenCodeStreamSink;
   onSessionId?: (sessionId: string) => void;
+  /** The turn's Pi tools; refused native calls to them are handed to Pi. */
+  piTools?: PiTools;
 }): Promise<{ code: number | null; state: OpenCodeTurnState }> {
-  const { server, directory, body, signal, timeoutMs, model, output, sink } = params;
+  const { server, directory, body, signal, timeoutMs, model, output, sink, piTools } = params;
   const state: OpenCodeTurnState = {
     text: "",
     thinking: "",
@@ -2173,6 +2297,12 @@ export async function runOpenCodeServerTurn(params: {
       if (!part || part.sessionID !== state.sessionId || userMessages.has(part.messageID)) {
         return false;
       }
+      // Same as `opencode run`: once the model moves past the message with
+      // relayed calls, the turn ends and Pi runs them.
+      if (isPastRelay(state, part.messageID) || (state.relayed && part.type === "step-start")) {
+        state.stoppedForRelay = true;
+        return true;
+      }
       // Only the model's own parts carry `time`; the prompt's text part
       // does not.
       if ((part.type === "text" || part.type === "reasoning") && part.time && !part.synthetic) {
@@ -2190,25 +2320,34 @@ export async function runOpenCodeServerTurn(params: {
           state.finishReason = "length";
         }
         const tokens = part.tokens;
-        if (!tokens) return false;
-        output.usage.input = Number(tokens.input ?? 0);
-        output.usage.output = Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
-        output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
-        output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
-        output.usage.totalTokens = Number(
-          tokens.total ??
-            output.usage.input +
-              output.usage.output +
-              output.usage.cacheRead +
-              output.usage.cacheWrite,
-        );
-        calculateCost(model, output.usage);
+        if (tokens) {
+          output.usage.input = Number(tokens.input ?? 0);
+          output.usage.output = Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+          output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
+          output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+          output.usage.totalTokens = Number(
+            tokens.total ??
+              output.usage.input +
+                output.usage.output +
+                output.usage.cacheRead +
+                output.usage.cacheWrite,
+          );
+          calculateCost(model, output.usage);
+        }
+        if (state.relayed) {
+          state.stoppedForRelay = true;
+          return true;
+        }
         return false;
       }
       if (part.type === "tool" && (part.state?.status === "completed" || part.state?.status === "error")) {
         // Same rule as `opencode run`: a refused OpenCode tool changed
         // nothing, a tool that executed fails the turn.
         if (!isRefusedTool(part.state)) state.toolUse = part.tool ? String(part.tool) : "unknown";
+        else {
+          const call = relayableCall(part, piTools);
+          if (call) recordRelay(state, part, call);
+        }
       }
       return false;
     }
@@ -2257,6 +2396,17 @@ export async function runOpenCodeServerTurn(params: {
           finished = true;
           break;
         }
+      }
+      if (state.stoppedForRelay) {
+        // The session is still generating the model's next step; stop it.
+        await serverRequest(
+          server,
+          "POST",
+          `/session/${sessionId}/abort`,
+          directory,
+          undefined,
+          AbortSignal.timeout(SESSION_DELETE_TIMEOUT_MS),
+        ).catch(() => undefined);
       }
     } finally {
       await events.return(undefined).catch(() => undefined);
@@ -2447,6 +2597,9 @@ export function streamOpenCode(
       // Pi supplies no timeoutMs (#73).
       const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
       const bin = opencodeBin();
+      const turnTools = resolveTurnTools(context);
+      const allowedToolNames = new Set(turnTools.map((tool) => tool.name));
+      const piTools: PiTools = new Map(turnTools.map((tool) => [tool.name, tool]));
       let turn: { code: number | null; state: OpenCodeTurnState } | undefined;
       if (dialect === "v1" && streamingEnabled() && serverUnavailableFor !== bin) {
         // OpenCode v2's server speaks a different API, so only v1 streams.
@@ -2494,6 +2647,7 @@ export function streamOpenCode(
                 onSessionId: (id) => {
                   capturedSessionId = id;
                 },
+                piTools,
               });
             },
           );
@@ -2512,6 +2666,7 @@ export function streamOpenCode(
         timeoutMs: turnTimeoutMs,
         model,
         output,
+        piTools,
       });
       // OpenCode's standalone server can resolve `--agent` before it has
       // loaded the project agent file, which fails the turn with "Agent not
@@ -2531,6 +2686,7 @@ export function streamOpenCode(
           timeoutMs: turnTimeoutMs,
           model,
           output,
+          piTools,
         });
       }
       const { code, state } = turn;
@@ -2542,7 +2698,9 @@ export function streamOpenCode(
       if (state.timedOut) {
         throw new Error(`opencode timed out after ${turnTimeoutMs}ms`);
       }
-      if (code !== 0) {
+      // Stopping OpenCode after a relayed step is the bridge's doing, not a
+      // failed run.
+      if (code !== 0 && !state.stoppedForRelay) {
         throw new Error(
           state.stderr.trim() || `opencode exited with code ${code}`,
         );
@@ -2559,9 +2717,6 @@ export function streamOpenCode(
       const stderr = state.stderr;
       const finishReason = state.finishReason;
 
-      const allowedToolNames = new Set(
-        resolveTurnTools(context).map((tool) => tool.name),
-      );
       const toolCallResult = parseToolCallResponse(
         accumulatedText,
         allowedToolNames,
@@ -2571,7 +2726,7 @@ export function streamOpenCode(
           toolCallRejectionMessage(toolCallResult, allowedToolNames),
         );
       }
-      const toolCalls = toolCallResult.calls;
+      const toolCalls = mergeRelayedCalls(toolCallResult.calls, state.relayed?.calls);
       // Unrecoverable marker text is stripped so it never leaks into the
       // visible chat response; remaining prose still displays normally.
       let displayText = toolCallResult.cleanedText ?? accumulatedText;
@@ -2631,13 +2786,19 @@ export function streamOpenCode(
       );
       // The turn succeeded: record the session for reuse, or delete the
       // one-shot session record so it cannot accumulate (#71, #75).
-      if (piState) {
+      if (piState && !state.relayed) {
         piState.opencodeSessionId =
           capturedSessionId ?? piState.opencodeSessionId;
         piState.modelId = model.id;
         piState.toolsKey = serializeTools(resolveTurnTools(context));
         piState.systemPrompt = resolveTurnSystemPrompt(context);
         piState.sentParts = transcriptParts;
+      } else if (piState) {
+        // OpenCode's copy of a relayed turn ends at its refusal, which the
+        // next turn would continue from, so that turn starts fresh.
+        piState.opencodeSessionId =
+          capturedSessionId ?? piState.opencodeSessionId;
+        dropOpencodeSession(piState);
       } else {
         deleteOpenCodeSession(capturedSessionId);
       }
